@@ -1,0 +1,7 @@
+streamlit
+pandas
+qrcode
+streamlit-authenticator
+python-dotenv
+openpyxl
+boto3
