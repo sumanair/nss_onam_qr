@@ -9,3 +9,9 @@ sqlalchemy
 psycopg2
 tabulate
 opencv-python
+streamlit-webrtc 
+av
+streamlit-qrcode-scanner
+streamlit-js-eval 
+opencv-python-headless
+
