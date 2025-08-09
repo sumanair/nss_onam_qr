@@ -1,1 +1,5 @@
-echo ".env" >> .gitignore
+# secrets
+.env
+*.env
+*.pem
+nssnt-key.pem
