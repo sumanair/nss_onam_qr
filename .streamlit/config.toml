@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#D72638"               # Red (from logo ribbon)
+backgroundColor = "#FFFFFF"            # Main page - warm parchment
+secondaryBackgroundColor = "#f8f0e0ff"   # Sidebar/cards - soft gold
+textColor = "#2C2C2C"
+font = "sans serif"

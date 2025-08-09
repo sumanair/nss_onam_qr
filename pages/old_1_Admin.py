@@ -41,7 +41,7 @@ if uploaded_file:
         "number_of_attendees": 1,
         "number_checked_in": 0,
         "qr_reissued_yn": False,
-        "qr_code_name": "",
+        "qr_code_filename": "",
         "qr_generated_at": None,
         "qr_sent_at": None,
         "updated_at": datetime.datetime.now(),

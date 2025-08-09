@@ -5,3 +5,6 @@ streamlit-authenticator
 python-dotenv
 openpyxl
 boto3
+sqlalchemy
+psycopg2
+tabulate

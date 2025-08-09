@@ -6,6 +6,9 @@ from pathlib import Path
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+from utils.styling import inject_global_styles
+inject_global_styles()
+
 # Grab credentials
 admin_username = os.getenv("ADMIN_USERNAME")
 admin_name = os.getenv("ADMIN_NAME")
@@ -78,44 +81,51 @@ elif auth_status is False:
 else:
     st.sidebar.warning("🔐 Please log in to access features.")
 
-# --- Home Page Content ---
 
 st.markdown("""
-
-    <style>
-    .big-title {
-        font-size: 2.5rem;
-        font-weight: 800;
-        margin-bottom: 0.25rem;
-    }
-    .subtitle {
-        font-size: 1.2rem;
-        margin-bottom: 2rem;
-        color: #666;
-    }
-    .info-box {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 6px solid #3b82f6;
-    }
-    </style>
-
+<h2 class="big-title">
+    <span class='emoji'>🎫</span> NSS Event QR Issuance & Verification
+</h1>
 """, unsafe_allow_html=True)
-
-st.markdown("<div class='big-title'>🎫 NSS Event QR Issuance & Verification</div>", unsafe_allow_html=True)
 st.markdown("<div class='subtitle'>Secure, simple event check-in — from sheet to QR to scanner</div>", unsafe_allow_html=True)
 
 cols = st.columns(3)
-cols[0].info("🛠️ **Admin Panel**\n\nUpload attendee data and issue QR codes.")
-cols[1].info("📤 **Issuance & Reissue**\n\nGenerate, preview, and email QR codes.")
-cols[2].info("✅ **Verifier View**\n\nScan and check in attendees at the event.")
+# cols[0].info("🛠️ **Admin Panel**\n\nUpload attendee data and issue QR codes.")
+# cols[1].info("📤 **Issuance & Reissue**\n\nGenerate, preview, and email QR codes.")
+# cols[2].info("✅ **Verifier View**\n\nScan and check in attendees at the event.")
 
-st.markdown("---")
+with st.container():
+    st.markdown('<div class="card-button">', unsafe_allow_html=True)
+    st.subheader("🛠️ Admin Panel")
+    st.write("Upload attendee data and issue QR codes.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card-button">', unsafe_allow_html=True)
+    st.subheader("📨 Issuance & Reissue")
+    st.write("Generate, preview, and email QR codes.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="card-button">', unsafe_allow_html=True)
+    st.subheader("✅ Verifier View")
+    st.write("Scan and check in attendees at the event.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
 st.markdown("""
-<div class='info-box'>
-🔐 Please use the **sidebar to log in** and access restricted pages.  
-🌐 Public QR view is available via QR code links.
-</div>
-""", unsafe_allow_html=True)
+
+    <div style="
+        background-color: #FFF7E6;
+        padding: 1rem;
+        border-left: 5px solid #800000;
+        border-radius: 8px;
+        margin-top: 2rem;
+        color: #5A0000;
+    ">
+        🔐 <strong>Please use the <em>sidebar to log in</em></strong> and access restricted pages.
+        🌐 Public QR view is available via the menu.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+
 
