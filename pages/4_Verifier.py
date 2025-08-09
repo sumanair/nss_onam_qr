@@ -280,7 +280,6 @@ left, right = st.columns([1, 1])
 
 with left:
     st.subheader("📹 Live Scan ")
-    st.caption("Point your camera at a QR code to scan it.")
 
     decoded_text = None
     qr_error = None
@@ -296,8 +295,6 @@ with left:
   </div>
   <div id="status" style="margin-top:8px;color:#444;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;"></div>
   <div id="result" style="margin-top:8px;max-width:__QRBOX__px;font-family:monospace;"></div>
-
-<button id="enableCamBtn" style="margin-top:10px;padding:10px 14px;border-radius:8px">Enable Camera</button>
 </div>
 
 <script type="module">
@@ -307,41 +304,6 @@ with left:
   const video = document.getElementById('qr-video');
   const status = document.getElementById('status');
   const resultEl = document.getElementById('result');
-  // Add a button in the HTML near your video (outside script):
-// <button id="enableCamBtn" style="margin-top:10px;padding:10px 14px;border-radius:8px">Enable Camera</button>
-
-    const enableBtn = document.getElementById('enableCamBtn') || (()=>{
-    // if you don't want to edit the HTML, we inject a button here:
-    const b = document.createElement('button');
-    b.id = 'enableCamBtn';
-    b.textContent = 'Enable Camera';
-    b.style.cssText = 'margin-top:10px;padding:10px 14px;border-radius:8px';
-    document.getElementById('qr-wrap').appendChild(b);
-    return b;
-    })();
-
-    async function requestCameraPermission() {
-    // iOS-friendly: ask for camera on a direct user gesture
-    try {
-        status.textContent = "Requesting camera permission…";
-        const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" } }, audio: false
-        });
-        // Stop immediately—this was only to trigger the permission prompt
-        stream.getTracks().forEach(t => t.stop());
-        status.textContent = "Camera permission granted ✅";
-        enableBtn.style.display = "none";
-        // Now start your QR scanner which will reuse the permission
-        await start();   // calls your QrScanner.start()
-    } catch (e) {
-        status.textContent = "Camera permission denied or unavailable: " + (e.name || e.message || e);
-        console.error(e);
-    }
-    }
-
-    enableBtn.addEventListener('click', requestCameraPermission);
-
-    
   // globals for Python polling
   window.qrDecoded = null;
   window.qrError = null;
