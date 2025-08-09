@@ -6,7 +6,7 @@ python-dotenv
 openpyxl
 boto3
 sqlalchemy
-psycopg2
+psycopg2-binary==2.9.9
 tabulate
 opencv-python
 streamlit-webrtc 
