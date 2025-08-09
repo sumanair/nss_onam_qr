@@ -8,3 +8,4 @@ boto3
 sqlalchemy
 psycopg2
 tabulate
+opencv-python
