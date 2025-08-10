@@ -5,30 +5,13 @@ import json
 import base64
 import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qs, unquote
 
-import cv2
-import numpy as np
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 from dotenv import load_dotenv
-
-# ── soft import: streamlit-webrtc (live scan) ───────────────────────────────────
-_WEBRTC_AVAILABLE = True
-try:
-    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
-    import av
-except Exception:
-    _WEBRTC_AVAILABLE = False
-
-# ── soft import: pyzbar (fallback decoder) ─────────────────────────────────────
-_PYZBAR_AVAILABLE = True
-try:
-    from pyzbar.pyzbar import decode as zbar_decode
-except Exception:
-    _PYZBAR_AVAILABLE = False
 
 from utils.db import get_engine
 from utils.styling import inject_global_styles
@@ -48,7 +31,6 @@ if Path(LOGO).exists():
         st.image(LOGO, use_container_width=True)
 
 st.title("🛂 Attendance Check‑In (Verifier)")
-
 engine = get_engine()
 
 # ──────────────────────────────────────────────────────────────
@@ -130,7 +112,6 @@ def _extract_txn_from_json_text(txt: str) -> Optional[str]:
     return None
 
 def _extract_txn_from_url(url: str) -> Optional[str]:
-    # Handles ...?transaction_id=..., ?txn=..., or ?data=<base64(json)>
     try:
         u = urlparse(url)
     except Exception:
@@ -163,48 +144,15 @@ def parse_scanned_text_to_txn(text: str) -> Optional[str]:
         return None
     s = text.strip()
     if s.startswith("{") and s.endswith("}"):
-        tx = _extract_txn_from_json_text(s);  return tx
+        return _extract_txn_from_json_text(s)
     if s.startswith(("http://", "https://")):
-        tx = _extract_txn_from_url(s);        return tx
+        return _extract_txn_from_url(s)
     decoded = _b64_try(s)
     if decoded:
-        tx = _extract_txn_from_json_text(decoded);  return tx
+        return _extract_txn_from_json_text(decoded)
     if re.fullmatch(r"[A-Za-z0-9\-_=]{6,}", s):
         return s
     return None
-
-def decode_qr_from_image_bytes(buf: bytes) -> List[str]:
-    """Still-photo fallback decode (used if WebRTC unavailable)."""
-    npbuf = np.frombuffer(buf, np.uint8)
-    img = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
-    if img is None:
-        return []
-    det = cv2.QRCodeDetector()
-    try:
-        ok, decoded, _, _ = det.detectAndDecodeMulti(img)
-        if ok and decoded:
-            return [d for d in decoded if d]
-    except Exception:
-        pass
-    try:
-        d_single, _ = det.detectAndDecode(img)
-        if d_single:
-            return [d_single]
-    except Exception:
-        pass
-
-    # optional: pyzbar fallback on stills
-    if _PYZBAR_AVAILABLE:
-        try:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            for obj in zbar_decode(gray):
-                txt = obj.data.decode("utf-8", errors="ignore")
-                if txt:
-                    return [txt]
-        except Exception:
-            pass
-
-    return []
 
 def fetch_attendance_row(txn_id: str) -> Optional[dict]:
     with engine.connect() as conn:
@@ -236,7 +184,10 @@ def add_checkins(txn_id: str, add_count: int) -> Tuple[bool, str]:
             return False, "Transaction not found."
 
         total   = _coerce_int(current["number_of_attendees"], 0)
-        checked = _coerce_int(current["number_of_attendees"] if current.get("number_checked_in") is None else current["number_checked_in"], 0)
+        checked = _coerce_int(
+            current["number_of_attendees"] if current.get("number_checked_in") is None
+            else current["number_checked_in"], 0
+        )
         remain  = max(0, total - checked)
         if add_count > remain:
             return False, f"Only {remain} attendee(s) remaining. Cannot admit {add_count}."
@@ -253,10 +204,6 @@ def add_checkins(txn_id: str, add_count: int) -> Tuple[bool, str]:
     return True, f"Checked in {add_count} attendee(s)."
 
 def extract_payload_json(decoded_text: str) -> Optional[dict]:
-    """
-    Try to get a JSON payload embedded in a URL (?data= / ?payload= / ?qr= / ?p=),
-    or base64-encoded JSON, or direct JSON string. Returns dict or {"_raw": "..."}.
-    """
     if not decoded_text:
         return None
     try:
@@ -290,199 +237,174 @@ def extract_payload_json(decoded_text: str) -> Optional[dict]:
     return None
 
 # ──────────────────────────────────────────────────────────────
-# Live QR scanner (WebRTC) – robust processor
-# ──────────────────────────────────────────────────────────────
-if _WEBRTC_AVAILABLE:
-    class QRVideoProcessor(VideoProcessorBase):
-        def __init__(self):
-            self.last_texts: List[str] = []
-            self.det = cv2.QRCodeDetector()
-            self.use_mirror = False  # toggled via session state
-
-        def _preprocess(self, img_bgr):
-            # Optional mirror
-            if self.use_mirror:
-                img_bgr = cv2.flip(img_bgr, 1)
-
-            # Upscale small frames
-            h, w = img_bgr.shape[:2]
-            if w < 640:
-                scale = 640 / float(w)
-                img_bgr = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # Local contrast
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            gray = clahe.apply(gray)
-            # Gentle denoise
-            gray = cv2.bilateralFilter(gray, d=5, sigmaColor=50, sigmaSpace=50)
-            # Adaptive threshold
-            thr = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 5
-            )
-            return img_bgr, thr
-
-        def _try_decode_opencv(self, bin_img):
-            texts = []
-            boxes = []
-
-            # Multi
-            try:
-                ok, decoded, points, _ = self.det.detectAndDecodeMulti(bin_img)
-                if ok and decoded:
-                    for i, d in enumerate(decoded):
-                        if d and points is not None:
-                            texts.append(d)
-                            boxes.append(points[i].astype(int).reshape(-1, 2))
-            except Exception:
-                pass
-
-            # Single
-            if not texts:
-                try:
-                    d_single, p_single = self.det.detectAndDecode(bin_img)
-                    if d_single:
-                        texts.append(d_single)
-                        if p_single is not None and len(p_single) == 4:
-                            boxes.append(p_single.astype(int))
-                except Exception:
-                    pass
-
-            return texts, boxes
-
-        def _try_decode_pyzbar(self, img_bgr):
-            texts = []
-            boxes = []
-            if not _PYZBAR_AVAILABLE:
-                return texts, boxes
-            try:
-                gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-                for obj in zbar_decode(gray):
-                    txt = obj.data.decode("utf-8", errors="ignore")
-                    if txt:
-                        texts.append(txt)
-                        # polygon points if available
-                        pts = []
-                        if getattr(obj, "polygon", None):
-                            pts = [[p.x, p.y] for p in obj.polygon]
-                        elif getattr(obj, "rect", None):
-                            x, y, w, h = obj.rect.left, obj.rect.top, obj.rect.width, obj.rect.height
-                            pts = [[x, y], [x+w, y], [x+w, y+h], [x, y+h]]
-                        if pts:
-                            boxes.append(np.array(pts, dtype=int))
-            except Exception:
-                pass
-            return texts, boxes
-
-        def recv(self, frame: "av.VideoFrame") -> "av.VideoFrame":
-            img = frame.to_ndarray(format="bgr24")
-
-            # Read mirror toggle from session
-            self.use_mirror = bool(st.session_state.get("qr_mirror", False))
-
-            # Preprocess
-            img_bgr, bin_img = self._preprocess(img)
-
-            # Try multiple rotations (opencv)
-            rotations = [
-                bin_img,
-                cv2.rotate(bin_img, cv2.ROTATE_90_CLOCKWISE),
-                cv2.rotate(bin_img, cv2.ROTATE_180),
-                cv2.rotate(bin_img, cv2.ROTATE_90_COUNTERCLOCKWISE),
-            ]
-
-            texts = []
-            boxes = []
-            for rot in rotations:
-                t, b = self._try_decode_opencv(rot)
-                if t:
-                    texts, boxes = t, b
-                    break
-
-            # If still nothing, try pyzbar fallback on the (preprocessed) BGR
-            if not texts:
-                t2, b2 = self._try_decode_pyzbar(img_bgr)
-                if t2:
-                    texts, boxes = t2, b2
-
-            # Draw boxes only when we got text
-            if texts and boxes:
-                for pts in boxes:
-                    for i in range(len(pts)):
-                        cv2.line(img_bgr, tuple(pts[i]), tuple(pts[(i + 1) % len(pts)]), (0, 255, 0), 2)
-
-            self.last_texts = texts
-            return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
-
-# ──────────────────────────────────────────────────────────────
-# Scan / manual input
+# Layout
 # ──────────────────────────────────────────────────────────────
 left, right = st.columns([1, 1])
 
+# ──────────────────────────────────────────────────────────────
+# Single, clean HTML5 scanner (QrScanner)
+# ──────────────────────────────────────────────────────────────
 with left:
     st.subheader("📹 Live Scan")
 
-    if _WEBRTC_AVAILABLE:
-        with st.sidebar:
-            st.toggle("🔁 Mirror camera", key="qr_mirror", value=False,
-                      help="Some webcams feed mirrored frames; toggle if boxes look reversed.")
+    decoded_text = None
+    qr_error = None
 
-        ctx = webrtc_streamer(
-            key="qr-stream",
-            mode=WebRtcMode.SENDRECV,
-            video_processor_factory=QRVideoProcessor,
-            media_stream_constraints={
-                "video": {
-                    "facingMode": {"ideal": "environment"},  # rear camera on phones, if available
-                    "width": {"ideal": 1280},
-                    "height": {"ideal": 720},
-                    "frameRate": {"ideal": 30}
-                },
-                "audio": False
-            },
-            async_processing=True,
-        )
+    from streamlit.components.v1 import html as st_html
+    from streamlit_js_eval import streamlit_js_eval  # pip install streamlit-js-eval
 
-        if ctx and ctx.video_processor:
-            texts = ctx.video_processor.last_texts or []
-            if texts:
-                st.success("QR detected!")
-                latest = texts[0]
-                st.code(latest, language="text")
+    qrbox_max = 560  # max width in px; shrinks on phones
 
-                st.session_state["verifier_raw"] = latest
-                st.session_state["verifier_payload_json"] = extract_payload_json(latest)
-                tx = parse_scanned_text_to_txn(latest)
-                if tx:
-                    st.session_state["verifier_txn"] = tx
-                else:
-                    st.warning("Couldn’t extract a transaction id from the QR.")
-            else:
-                st.info("Point a QR at the camera… steady, good lighting, fill ~60% of frame.")
+    # NB: keep regex literals to simple, valid flags only. No dynamic flags.
+    HTML_TEMPLATE = r"""
+<style>
+  #qr-wrap { display:flex; flex-direction:column; align-items:center; }
+  #qr-box  { width:min(92vw, __QRBOX__px); aspect-ratio: 3 / 4; position:relative; }
+  #qr-video{ width:100%; height:100%; object-fit:cover; border-radius:12px;
+             box-shadow:0 4px 12px rgba(0,0,0,.12); background:#000; }
+  .corner{position:absolute;width:18%;height:18%;border:4px solid #f4b000;border-radius:14px;}
+  .tl{top:4%;left:4%;border-right:none;border-bottom:none;}
+  .tr{top:4%;right:4%;border-left:none;border-bottom:none;}
+  .bl{bottom:4%;left:4%;border-right:none;border-top:none;}
+  .br{bottom:4%;right:4%;border-left:none;border-top:none;}
+  #status{ margin-top:8px; color:#444; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+  #result{ margin-top:8px; max-width:min(92vw,__QRBOX__px); font-family:monospace; }
+  #startbtn{ margin:8px 0 0; padding:10px 14px; border-radius:10px; border:1px solid #ddd; background:#fff; }
+</style>
+
+<div id="qr-wrap">
+  <div id="qr-box">
+    <video id="qr-video" muted playsinline></video>
+    <div class="corner tl"></div><div class="corner tr"></div>
+    <div class="corner bl"></div><div class="corner br"></div>
+  </div>
+  <button id="startbtn">🎥 Start camera</button>
+  <div id="status"></div>
+  <div id="result"></div>
+</div>
+
+<script type="module">
+  import QrScanner from 'https://cdn.jsdelivr.net/npm/qr-scanner@1.4.2/qr-scanner.min.js';
+  QrScanner.WORKER_PATH = 'https://cdn.jsdelivr.net/npm/qr-scanner@1.4.2/qr-scanner-worker.min.js';
+
+  const video   = document.getElementById('qr-video');
+  const status  = document.getElementById('status');
+  const resultEl= document.getElementById('result');
+  const btn     = document.getElementById('startbtn');
+
+  // values polled by Streamlit
+  window.qrDecoded = null;
+  window.qrError   = null;
+
+  function renderJsonAsTable(obj) {
+    try {
+      const entries = Object.entries(obj || {})
+        .map(([k,v]) => `<tr><th style='text-align:left;padding:4px 6px;border:1px solid #ddd;'>${k}</th>
+                           <td style='padding:4px 6px;border:1px solid #ddd;'>${
+                             (v && typeof v === 'object')
+                               ? `<pre style="white-space:pre-wrap;margin:0">${JSON.stringify(v,null,2)}</pre>` : v
+                           }</td></tr>`).join('');
+      return `<table style='width:100%;border-collapse:collapse;margin-top:6px;font-family:monospace'><tbody>${entries}</tbody></table>`;
+    } catch { return ''; }
+  }
+
+  function b64UrlDecode(s){
+    try { return atob((s||'').replace(/-/g,'+').replace(/_/g,'/')); }
+    catch { return null; }
+  }
+  function hexToUtf8(hex){
+    if(!hex) return '';
+    const arr = (hex.match(/.{1,2}/g)||[]).map(b => parseInt(b,16));
+    return new TextDecoder().decode(new Uint8Array(arr));
+  }
+
+  async function startScanner() {
+    btn.disabled = true;
+    status.textContent = "Initializing camera…";
+
+    // prefer rear camera when available
+    let deviceId;
+    try {
+      const cams = await QrScanner.listCameras(true);
+      const rear = cams.find(c => /back|rear|environment/i.test(c.label||''));
+      deviceId = (rear || cams[cams.length-1] || {}).id;
+    } catch {}
+
+    const scanner = new QrScanner(
+      video,
+      (result) => {
+        try {
+          let txt = result?.data || result || ''; // qr-scanner returns object when returnDetailedScanResult:true
+          // If it looks like a URL with ?data= try to decode
+          if (/^https?:\/\/.*/.test(txt)) {
+            const u = new URL(txt);
+            const d = u.searchParams.get('data') || u.searchParams.get('payload') || u.searchParams.get('qr') || u.searchParams.get('p');
+            if (d) {
+              const b = b64UrlDecode(d);
+              txt = b ?? hexToUtf8(decodeURIComponent(d));
+            }
+          }
+          window.qrDecoded = txt || null;
+          try {
+            const obj = JSON.parse(txt); const main = obj.data || obj;
+            resultEl.innerHTML = "<b>✅ Decoded</b>" + renderJsonAsTable(main);
+          } catch { resultEl.textContent = txt ? ("✅ " + txt) : "No data"; }
+        } catch (e) {
+          window.qrError = e?.message || String(e);
+        } finally {
+          scanner.stop();
+          status.textContent = "Scan complete.";
+        }
+      },
+      {
+        preferredCamera: deviceId || undefined,
+        highlightScanRegion: true,
+        highlightCodeOutline: true,
+        returnDetailedScanResult: true
+      }
+    );
+    scanner.setInversionMode('both');
+
+    try {
+      video.setAttribute('autoplay',''); // iOS hint
+      await scanner.start();
+      status.textContent = "Point the QR inside the frame…";
+    } catch (err) {
+      window.qrError = err?.message || String(err);
+      status.textContent = "Camera access denied or not available.";
+      btn.disabled = false;
+    }
+  }
+
+  btn.addEventListener('click', startScanner);
+</script>
+"""
+    st_html(HTML_TEMPLATE.replace("__QRBOX__", str(qrbox_max)), height=640, scrolling=False)
+
+    # poll JS -> Python
+    decoded_text = streamlit_js_eval(js_expressions="window.qrDecoded || null", key="qr_poll_v1")
+    qr_error     = streamlit_js_eval(js_expressions="window.qrError || null",   key="qr_err_v1")
+
+    if qr_error:
+        st.caption(f"Scanner notice: {qr_error}")
+
+    # Post‑process
+    if decoded_text:
+        st.success("QR detected!")
+        st.code(decoded_text, language="text")
+        st.session_state["verifier_raw"] = decoded_text
+        st.session_state["verifier_payload_json"] = extract_payload_json(decoded_text)
+        tx = parse_scanned_text_to_txn(decoded_text)
+        if tx:
+            st.session_state["verifier_txn"] = tx
         else:
-            st.info("Initializing camera…")
-
+            st.warning("Couldn’t extract a transaction id from the QR.")
     else:
-        st.warning("Live scan module not found. Falling back to snapshot mode. "
-                   "Install with: pip install streamlit-webrtc av")
+        st.info("Tap **Start camera** and point it at the QR.")
 
-        cam_file = st.camera_input("Use your device camera (snapshot)")
-        if cam_file is not None:
-            decoded_texts = decode_qr_from_image_bytes(cam_file.getvalue())
-            if decoded_texts:
-                st.success("QR detected!")
-                for t in decoded_texts:
-                    st.code(t, language="text")
-                tx = parse_scanned_text_to_txn(decoded_texts[0])
-                st.session_state["verifier_raw"] = decoded_texts[0]
-                st.session_state["verifier_payload_json"] = extract_payload_json(decoded_texts[0])
-                if tx:
-                    st.session_state["verifier_txn"] = tx
-                else:
-                    st.warning("Couldn’t extract a transaction id from the QR. Paste it on the right.")
-            else:
-                st.warning("No QR code found in the frame.")
-
+# ──────────────────────────────────────────────────────────────
+# Manual entry + results / actions
+# ──────────────────────────────────────────────────────────────
 with right:
     st.subheader("⌨️ Manual Entry")
     manual = st.text_input(
@@ -501,9 +423,6 @@ with right:
 
 st.divider()
 
-# ──────────────────────────────────────────────────────────────
-# Show decoded payload (pretty)
-# ──────────────────────────────────────────────────────────────
 with st.expander("📦 Decoded Payload", expanded=True):
     payload = st.session_state.get("verifier_payload_json")
     raw = st.session_state.get("verifier_raw")
@@ -515,9 +434,6 @@ with st.expander("📦 Decoded Payload", expanded=True):
     else:
         st.write("Scan a QR to view its payload.")
 
-# ──────────────────────────────────────────────────────────────
-# Attendance look‑up and actions
-# ──────────────────────────────────────────────────────────────
 txn_id = (st.session_state.get("verifier_txn") or "").strip()
 if not txn_id:
     st.info("Scan a QR or paste a code to begin.")
@@ -530,7 +446,10 @@ if not row:
 
 username  = row.get("username") or "(unknown)"
 total     = _coerce_int(row.get("number_of_attendees"), 0)
-checked   = _coerce_int(row.get("number_of_attendees") if row.get("number_checked_in") is None else row.get("number_checked_in"), 0)
+checked   = _coerce_int(
+    row.get("number_of_attendees") if row.get("number_checked_in") is None
+    else row.get("number_checked_in"), 0
+)
 remaining = max(0, total - checked)
 
 st.markdown(f"### 👤 {username}")
@@ -545,7 +464,7 @@ if remaining == 0:
 
 admit = st.number_input(
     "Admit now",
-    min_value=1, max_value=remaining, value=min(1, remaining), step=1,
+    min_value=1, max_value=remaining, value=1, step=1,
     help="How many to admit for this transaction right now."
 )
 
@@ -568,4 +487,4 @@ with col_b:
         else:
             st.warning(msg)
 
-st.caption("Tip: if a QR won’t scan, paste the code text into Manual Entry.")
+st.caption("Tip: if a QR won’t scan, paste the code into Manual Entry.")

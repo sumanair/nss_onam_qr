@@ -5,11 +5,9 @@ import json
 import base64
 import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qs, unquote
 
-import cv2
-import numpy as np
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
@@ -17,20 +15,7 @@ from dotenv import load_dotenv
 
 from utils.db import get_engine
 from utils.styling import inject_global_styles
-
-# ── optional scanners / components ─────────────────────────────────────────────
-_HTML5_CUSTOM = True
-try:
-    import streamlit.components.v1 as components
-    from streamlit_js_eval import streamlit_js_eval  # pip install streamlit-js-eval
-except Exception:
-    _HTML5_CUSTOM = False
-
-_SCANNER_AVAILABLE = True
-try:
-    from streamlit_qrcode_scanner import qrcode_scanner  # pip install streamlit-qrcode-scanner
-except Exception:
-    _SCANNER_AVAILABLE = False
+from streamlit_js_eval import streamlit_js_eval
 
 # ──────────────────────────────────────────────────────────────
 # Page setup
@@ -47,7 +32,6 @@ if Path(LOGO).exists():
         st.image(LOGO, use_container_width=True)
 
 st.title("🛂 Attendance Check‑In (Verifier)")
-
 engine = get_engine()
 
 # ──────────────────────────────────────────────────────────────
@@ -98,7 +82,7 @@ if role not in {"verifier", "admin"}:
     st.stop()
 
 # ──────────────────────────────────────────────────────────────
-# Helpers: parsing & DB
+# Helpers
 # ──────────────────────────────────────────────────────────────
 def _coerce_int(v, default=0) -> int:
     try:
@@ -161,35 +145,15 @@ def parse_scanned_text_to_txn(text: str) -> Optional[str]:
         return None
     s = text.strip()
     if s.startswith("{") and s.endswith("}"):
-        tx = _extract_txn_from_json_text(s);  return tx
+        return _extract_txn_from_json_text(s)
     if s.startswith(("http://", "https://")):
-        tx = _extract_txn_from_url(s);        return tx
+        return _extract_txn_from_url(s)
     decoded = _b64_try(s)
     if decoded:
-        tx = _extract_txn_from_json_text(decoded);  return tx
+        return _extract_txn_from_json_text(decoded)
     if re.fullmatch(r"[A-Za-z0-9\-_=]{6,}", s):
         return s
     return None
-
-def decode_qr_from_image_bytes(buf: bytes) -> List[str]:
-    npbuf = np.frombuffer(buf, np.uint8)
-    img = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
-    if img is None:
-        return []
-    det = cv2.QRCodeDetector()
-    try:
-        ok, decoded, _, _ = det.detectAndDecodeMulti(img)
-        if ok and decoded:
-            return [d for d in decoded if d]
-    except Exception:
-        pass
-    try:
-        d_single, _ = det.detectAndDecode(img)
-        if d_single:
-            return [d_single]
-    except Exception:
-        pass
-    return []
 
 def fetch_attendance_row(txn_id: str) -> Optional[dict]:
     with engine.connect() as conn:
@@ -204,285 +168,272 @@ def fetch_attendance_row(txn_id: str) -> Optional[dict]:
         ).mappings().first()
         return dict(row) if row else None
 
-def add_checkins(txn_id: str, add_count: int) -> Tuple[bool, str]:
-    if add_count <= 0:
-        return False, "Nothing to add."
+def _bounded_update(txn_id: str, delta: int) -> Tuple[bool, str]:
+    """
+    Add (or subtract) from number_checked_in safely:
+    - never below 0
+    - never above number_of_attendees
+    """
+    if delta == 0:
+        return False, "No change requested."
+
     with engine.begin() as conn:
-        current = conn.execute(
+        cur = conn.execute(
             text("""
-                SELECT number_of_attendees, number_checked_in
+                SELECT number_of_attendees AS total, COALESCE(number_checked_in, 0) AS checked
                 FROM event_payment
                 WHERE transaction_id = :txn
                 FOR UPDATE
             """),
             {"txn": txn_id}
         ).mappings().first()
-        if not current:
+
+        if not cur:
             return False, "Transaction not found."
 
-        total   = _coerce_int(current["number_of_attendees"], 0)
-        checked = _coerce_int(
-            current["number_of_attendees"] if current.get("number_checked_in") is None
-            else current["number_checked_in"], 0
-        )
-        remain  = max(0, total - checked)
-        if add_count > remain:
-            return False, f"Only {remain} attendee(s) remaining. Cannot admit {add_count}."
+        total   = _coerce_int(cur["total"], 0)
+        checked = _coerce_int(cur["checked"], 0)
+        new_val = checked + int(delta)
+
+        if new_val < 0:
+            return False, "Cannot reduce below 0."
+        if new_val > total:
+            remain = max(0, total - checked)
+            return False, f"Only {remain} remaining; cannot admit {delta}."
 
         conn.execute(
             text("""
                 UPDATE event_payment
-                SET number_checked_in = number_checked_in + :add,
-                    last_updated_at = :now
+                SET number_checked_in = :val,
+                    last_updated_at   = :now
                 WHERE transaction_id = :txn
             """),
-            {"add": int(add_count), "txn": txn_id, "now": datetime.datetime.now()}
+            {"val": new_val, "txn": txn_id, "now": datetime.datetime.now()}
         )
-    return True, f"Checked in {add_count} attendee(s)."
 
-def extract_payload_json(decoded_text: str) -> Optional[dict]:
-    if not decoded_text:
-        return None
-    try:
-        if decoded_text.startswith(("http://", "https://")):
-            u = urlparse(decoded_text)
-            q = parse_qs(u.query or "")
-            for k in ("data", "payload", "qr", "p"):
-                if k in q and q[k]:
-                    decoded = _b64_try(unquote(q[k][0]))
-                    if decoded:
-                        try:
-                            return json.loads(decoded)
-                        except Exception:
-                            return {"_raw": decoded}
-    except Exception:
-        pass
-
-    b = _b64_try(decoded_text)
-    if b:
-        try:
-            return json.loads(b)
-        except Exception:
-            return {"_raw": b}
-
-    if decoded_text.strip().startswith("{") and decoded_text.strip().endswith("}"):
-        try:
-            return json.loads(decoded_text)
-        except Exception:
-            pass
-
-    return None
+    if delta > 0:
+        return True, f"Checked in +{delta} attendee(s)."
+    else:
+        return True, f"Reduced check‑ins by {abs(delta)}."
 
 # ──────────────────────────────────────────────────────────────
-# Scan / manual input
+# Layout
 # ──────────────────────────────────────────────────────────────
 left, right = st.columns([1, 1])
 
+# ──────────────────────────────────────────────────────────────
+# HTML5 scanner (button to activate; reusable)
+# ──────────────────────────────────────────────────────────────
 with left:
-    st.subheader("📹 Live Scan ")
+    st.subheader("📹 Live Scan")
 
-    decoded_text = None
-    qr_error = None
+    from streamlit.components.v1 import html as st_html
 
-    # 1) Primary: custom qr-scanner (using placeholder replacement to avoid f-string brace issues)
-    if _HTML5_CUSTOM:
-        qrbox_size = 420  # visual width of the video element
-        HTML_TEMPLATE = """
-<div id="qr-wrap" style="display:flex;flex-direction:column;align-items:center;">
-  <div style="width:100%;max-width:__QRBOX__px;">
-    <video id="qr-video" muted autoplay playsinline style="
-      width:100%;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.12);"></video>
+    qrbox_max = 560  # max width in px; shrinks on phones
+    HTML_TEMPLATE = r"""
+<style>
+  #qr-wrap { display:flex; flex-direction:column; align-items:center; }
+  #qr-box  { width:min(92vw, __QRBOX__px); aspect-ratio: 3 / 4; position:relative; }
+  #qr-video{ width:100%; height:100%; object-fit:cover; border-radius:12px;
+             box-shadow:0 4px 12px rgba(0,0,0,.12); background:#000; }
+  .corner{position:absolute;width:18%;height:18%;border:4px solid #f4b000;border-radius:14px;}
+  .tl{top:4%;left:4%;border-right:none;border-bottom:none;}
+  .tr{top:4%;right:4%;border-left:none;border-bottom:none;}
+  .bl{bottom:4%;left:4%;border-right:none;border-top:none;}
+  .br{bottom:4%;right:4%;border-left:none;border-top:none;}
+  #status{ margin-top:8px; color:#444; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+  #result{ margin-top:8px; max-width:min(92vw,__QRBOX__px); font-family:monospace; }
+  #startbtn{ margin:8px 0 0; padding:10px 14px; border-radius:10px; border:1px solid #ddd; background:#fff; cursor:pointer; }
+</style>
+
+<div id="qr-wrap">
+  <div id="qr-box">
+    <video id="qr-video" muted playsinline></video>
+    <div class="corner tl"></div><div class="corner tr"></div>
+    <div class="corner bl"></div><div class="corner br"></div>
   </div>
-  <div id="status" style="margin-top:8px;color:#444;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;"></div>
-  <div id="result" style="margin-top:8px;max-width:__QRBOX__px;font-family:monospace;"></div>
+  <button id="startbtn">🎥 Start camera</button>
+  <div id="status">Click “Start camera” to scan the next ticket.</div>
+  <div id="result"></div>
 </div>
 
 <script type="module">
   import QrScanner from 'https://cdn.jsdelivr.net/npm/qr-scanner@1.4.2/qr-scanner.min.js';
   QrScanner.WORKER_PATH = 'https://cdn.jsdelivr.net/npm/qr-scanner@1.4.2/qr-scanner-worker.min.js';
 
-  const video = document.getElementById('qr-video');
-  const status = document.getElementById('status');
-  const resultEl = document.getElementById('result');
-  // globals for Python polling
+  const video   = document.getElementById('qr-video');
+  const status  = document.getElementById('status');
+  const resultEl= document.getElementById('result');
+  const btn     = document.getElementById('startbtn');
+
+  // values polled by Streamlit
   window.qrDecoded = null;
-  window.qrError = null;
-  
+  window.qrError   = null;
 
   function renderJsonAsTable(obj) {
-    const entries = Object.entries(obj || {})
-      .map(([k,v]) => `<tr>
-          <th style='text-align:left;padding:4px 6px;border:1px solid #ddd;'>${k}</th>
-          <td style='padding:4px 6px;border:1px solid #ddd;'>${
-            (v && typeof v === 'object')
-              ? `<pre style="white-space:pre-wrap;margin:0">${JSON.stringify(v,null,2)}</pre>`
-              : v
-          }</td>
-        </tr>`)
-      .join('');
-    return `<table style='width:100%;border-collapse:collapse;margin-top:6px;font-family:monospace'>
-              <tbody>${entries}</tbody>
-            </table>`;
+    try {
+      const entries = Object.entries(obj || {})
+        .map(([k,v]) => `<tr><th style='text-align:left;padding:4px 6px;border:1px solid #ddd;'>${k}</th>
+                           <td style='padding:4px 6px;border:1px solid #ddd;'>${
+                             (v && typeof v === 'object')
+                               ? `<pre style="white-space:pre-wrap;margin:0">${JSON.stringify(v,null,2)}</pre>` : v
+                           }</td></tr>`).join('');
+      return `<table style='width:100%;border-collapse:collapse;margin-top:6px;font-family:monospace'><tbody>${entries}</tbody></table>`;
+    } catch { return ''; }
   }
 
-  function hexToUtf8(hex) {
-    const bytes = new Uint8Array((hex || '').match(/.{1,2}/g).map(b => parseInt(b, 16)));
-    return new TextDecoder().decode(bytes);
+  function b64UrlDecode(s){
+    try { return atob((s||'').replace(/-/g,'+').replace(/_/g,'/')); }
+    catch { return null; }
+  }
+  function hexToUtf8(hex){
+    if(!hex) return '';
+    const arr = (hex.match(/.{1,2}/g)||[]).map(b => parseInt(b,16));
+    return new TextDecoder().decode(new Uint8Array(arr));
   }
 
-  async function start() {
+  async function startScanner() {
+    btn.disabled = true;
     status.textContent = "Initializing camera…";
 
-    // rear camera preference
-    let deviceId = undefined;
+    // prefer rear camera when available
+    let deviceId;
     try {
       const cams = await QrScanner.listCameras(true);
-      const rear = cams.find(c => /back|rear|environment/i.test(c.label || ''));
+      const rear = cams.find(c => /back|rear|environment/i.test(c.label||''));
       deviceId = (rear || cams[cams.length-1] || {}).id;
-    } catch (e) {}
+    } catch {}
 
     const scanner = new QrScanner(
       video,
       (result) => {
         try {
-          if (/^https?:\/\/.+\\?.*data=/.test(result)) {
-            const url = new URL(result);
-            const hexData = url.searchParams.get("data");
-            if (hexData) {
-              const jsonStr = hexToUtf8(decodeURIComponent(hexData));
-              window.qrDecoded = jsonStr;  // raw JSON string to Python
-              try {
-                const obj = JSON.parse(jsonStr);
-                const main = obj.data || obj;
-                resultEl.innerHTML = "<b>✅ Decoded Data</b>" + renderJsonAsTable(main);
-              } catch (e) {
-                resultEl.textContent = "✅ Scanned (non-JSON): " + jsonStr;
-              }
-            } else {
-              window.qrDecoded = result;
-              resultEl.textContent = "✅ Scanned URL: " + result;
+          let txt = result?.data || result || '';
+          if (/^https?:\/\/.*/.test(txt)) {
+            const u = new URL(txt);
+            const d = u.searchParams.get('data') || u.searchParams.get('payload') || u.searchParams.get('qr') || u.searchParams.get('p');
+            if (d) {
+              const b = b64UrlDecode(d);
+              txt = b ?? hexToUtf8(decodeURIComponent(d));
             }
-          } else {
-            window.qrDecoded = result;
-            resultEl.textContent = "✅ QR Text: " + result;
           }
+          window.qrDecoded = txt || null;
+          try {
+            const obj = JSON.parse(txt); const main = obj.data || obj;
+            resultEl.innerHTML = "<b>✅ Decoded</b>" + renderJsonAsTable(main);
+          } catch { resultEl.textContent = txt ? ("✅ " + txt) : "No data"; }
         } catch (e) {
-          window.qrError = "Decode error: " + (e?.message || e);
+          window.qrError = e?.message || String(e);
         } finally {
           scanner.stop();
-          status.textContent = "Scan complete.";
+          status.textContent = "Scan complete. Click Start to scan another.";
+          btn.disabled = false;
         }
       },
       {
-        preferredCamera: deviceId ? deviceId : undefined,
+        preferredCamera: deviceId || undefined,
         highlightScanRegion: true,
-        highlightCodeOutline: true
+        highlightCodeOutline: true,
+        returnDetailedScanResult: true
       }
     );
+    scanner.setInversionMode('both');
 
     try {
+      video.setAttribute('autoplay',''); // iOS hint
       await scanner.start();
-      status.textContent = "Point the QR into the frame…";
+      status.textContent = "Point the QR inside the frame…";
     } catch (err) {
       window.qrError = err?.message || String(err);
       status.textContent = "Camera access denied or not available.";
+      btn.disabled = false;
     }
   }
 
-  if (!window.__qr_started__) {
-    window.__qr_started__ = true;
-    start();
-  }
+  btn.addEventListener('click', startScanner);
 </script>
-        """.strip()
+"""
+    st_html(HTML_TEMPLATE.replace("__QRBOX__", str(qrbox_max)), height=640, scrolling=False)
 
-        html = HTML_TEMPLATE.replace("__QRBOX__", str(qrbox_size))
-        components.html(html, height=qrbox_size + 220, scrolling=False)
+    # Auto-refresh while waiting for JS to fill window.qrDecoded (lightweight)
+    polling = st.session_state.get("qr_polling", True)
+    if polling:
+        # update URL with a timestamp to trigger rerun ~1x/sec
+        st.query_params["_"] = datetime.datetime.now().timestamp()
 
-        decoded_text = streamlit_js_eval(js_expressions="window.qrDecoded || null", key="qr_custom_poll")
-        qr_error = streamlit_js_eval(js_expressions="window.qrError || null", key="qr_custom_err")
+    # Poll JS → Python
+    decoded_text = streamlit_js_eval(js_expressions="window.qrDecoded || null", key="qr_poll_v4")
+    qr_error     = streamlit_js_eval(js_expressions="window.qrError   || null", key="qr_err_v4")
 
-        if qr_error:
-            st.caption(f"Scanner notice: {qr_error}")
+    if qr_error:
+        st.caption(f"Scanner notice: {qr_error}")
 
-    # 2) Fallback: streamlit-qrcode-scanner (small fixed box)
-    if not decoded_text and _SCANNER_AVAILABLE:
-        st.divider()
-        st.caption("Fallback scanner:")
-        decoded_text = qrcode_scanner(key="qr_live_scanner")
-
-    # 3) Fallback: snapshot camera
-    if not decoded_text:
-        st.divider()
-        st.caption("If live scan doesn’t work, take a quick snapshot instead.")
-        cam_file = st.camera_input("Capture QR snapshot")
-        if cam_file is not None:
-            found = decode_qr_from_image_bytes(cam_file.getvalue())
-            if found:
-                decoded_text = found[0]
-
-    # Post-process
     if decoded_text:
+        st.session_state["qr_polling"] = False  # stop the refresh loop
         st.success("QR detected!")
         st.code(decoded_text, language="text")
         st.session_state["verifier_raw"] = decoded_text
-        st.session_state["verifier_payload_json"] = extract_payload_json(decoded_text)
-        tx = parse_scanned_text_to_txn(decoded_text)
-        if tx:
-            st.session_state["verifier_txn"] = tx
-        else:
-            st.warning("Couldn’t extract a transaction id from the QR.")
-    else:
-        st.info("Waiting for scan… On phones, open this page over HTTPS so the camera is allowed.")
 
+        # Extract txn id (robust)
+        tx = parse_scanned_text_to_txn(decoded_text)
+        if not tx:
+            # still store any JSON we can for debugging
+            st.session_state["verifier_payload_json"] = None
+            st.error("Couldn’t extract a transaction id from the QR. Please retry.")
+        else:
+            st.session_state["verifier_txn"] = tx
+            st.info(f"🔎 Parsed Transaction ID: **{tx}**")
+            st.rerun()
+
+# ──────────────────────────────────────────────────────────────
+# Manual entry (fallback)
+# ──────────────────────────────────────────────────────────────
 with right:
     st.subheader("⌨️ Manual Entry")
     manual = st.text_input(
-        "Scan or paste Transaction ID / QR contents",
+        "Paste Transaction ID / QR contents",
         value=st.session_state.get("verifier_txn", "")
     )
-    if st.button("Use this code"):
-        if manual.strip():
-            st.session_state["verifier_raw"] = manual.strip()
-            st.session_state["verifier_payload_json"] = extract_payload_json(manual.strip())
-            st.session_state["verifier_txn"] = parse_scanned_text_to_txn(manual.strip()) or manual.strip()
-        else:
-            st.session_state.pop("verifier_txn", None)
-            st.session_state.pop("verifier_raw", None)
-            st.session_state.pop("verifier_payload_json", None)
+    cma, cmb = st.columns([1,1])
+    with cma:
+        if st.button("Use this code"):
+            if manual.strip():
+                st.session_state["verifier_raw"] = manual.strip()
+                st.session_state["verifier_txn"] = parse_scanned_text_to_txn(manual.strip()) or manual.strip()
+                st.session_state["qr_polling"] = False
+                st.rerun()
+            else:
+                st.session_state.pop("verifier_txn", None)
+                st.session_state.pop("verifier_raw", None)
+                st.session_state["qr_polling"] = True
+    with cmb:
+        if st.button("🔄 Scan another"):
+            for k in ("verifier_txn","verifier_raw"):
+                st.session_state.pop(k, None)
+            st.session_state["qr_polling"] = True
+            st.rerun()
 
 st.divider()
 
 # ──────────────────────────────────────────────────────────────
-# Show decoded payload (pretty)
-# ──────────────────────────────────────────────────────────────
-with st.expander("📦 Decoded Payload", expanded=True):
-    payload = st.session_state.get("verifier_payload_json")
-    raw = st.session_state.get("verifier_raw")
-    if payload:
-        st.json(payload)
-    elif raw:
-        st.write("No JSON payload found. Raw value:")
-        st.code(raw, language="text")
-    else:
-        st.write("Scan a QR to view its payload.")
-
-# ──────────────────────────────────────────────────────────────
-# Attendance look‑up and actions
+# Attendee totals + actions (DB‑backed)
 # ──────────────────────────────────────────────────────────────
 txn_id = (st.session_state.get("verifier_txn") or "").strip()
 if not txn_id:
-    st.info("Scan a QR or paste a code to begin.")
     st.stop()
 
 row = fetch_attendance_row(txn_id)
 if not row:
-    st.error("Transaction not found. Double‑check the code or scan again.")
+    st.error(f"Transaction not found in DB for **{txn_id}**. "
+             "Confirm that this exact transaction_id is stored in event_payment.")
     st.stop()
 
 username  = row.get("username") or "(unknown)"
 total     = _coerce_int(row.get("number_of_attendees"), 0)
-checked   = _coerce_int(row.get("number_of_attendees") if row.get("number_checked_in") is None else row.get("number_checked_in"), 0)
+checked   = _coerce_int(
+    row.get("number_of_attendees") if row.get("number_checked_in") is None
+    else row.get("number_checked_in"), 0
+)
 remaining = max(0, total - checked)
 
 st.markdown(f"### 👤 {username}")
@@ -491,33 +442,52 @@ c1.metric("Purchased", total)
 c2.metric("Checked‑in", checked)
 c3.metric("Remaining", remaining)
 
+# If QR scanned after max attendee count is used up
 if remaining == 0:
-    st.success("All attendees for this ticket have already checked in. ✅")
-    st.stop()
+    st.error("All attendees for this ticket have already checked in. No more admits allowed.")
+else:
+    # Admit (increment)
+    admit = st.number_input(
+        "Admit now",
+        min_value=1, max_value=remaining, value=1, step=1,
+        help="How many to admit for this transaction right now."
+    )
 
-admit = st.number_input(
-    "Admit now",
-    min_value=1, max_value=remaining, value=1, step=1,
-    help="How many to admit for this transaction right now."
-)
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        if st.button("✅ Update Attendance"):
+            ok, msg = _bounded_update(txn_id, int(admit))  # +N
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
 
-col_a, col_b = st.columns(2)
-with col_a:
-    if st.button("✅ Update Attendance"):
-        ok, msg = add_checkins(txn_id, int(admit))
-        if ok:
-            st.success(msg)
-            st.rerun()
+    with col_b:
+        reduce_max = checked if checked > 0 else 0
+        if reduce_max > 0:
+            reduce = st.number_input(
+                "Undo / Reduce",
+                min_value=1, max_value=reduce_max, value=1, step=1,
+                help="Decrease checked‑in count if you admitted too many by mistake."
+            )
+            if st.button("↩️ Apply Reduction"):
+                ok, msg = _bounded_update(txn_id, -int(reduce))  # -N
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.warning(msg)
         else:
-            st.warning(msg)
+            st.caption("No check‑ins yet to undo.")
 
-with col_b:
-    if st.button(f"➡️ Admit All ({remaining})"):
-        ok, msg = add_checkins(txn_id, int(remaining))
-        if ok:
-            st.success(msg)
-            st.rerun()
-        else:
-            st.warning(msg)
+    with col_c:
+        if st.button(f"➡️ Admit All ({remaining})"):
+            ok, msg = _bounded_update(txn_id, int(remaining))
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
 
-st.caption("Tip: if a QR won’t scan, paste the code into Manual Entry.")
+st.caption("Tip: click **Scan another** or **Start camera** to handle the next guest.")
