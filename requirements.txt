@@ -14,4 +14,4 @@ av
 streamlit-qrcode-scanner
 streamlit-js-eval 
 opencv-python-headless
-
+streamlit-aggrid
