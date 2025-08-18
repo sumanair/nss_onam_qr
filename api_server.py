@@ -19,20 +19,26 @@ from services import attendance_service  # uses batch-aware child table
 # ──────────────────────────────────────────────
 # CORS (tighten in prod; keep only what you need)
 # ──────────────────────────────────────────────
-ALLOW_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    os.getenv("VERIFIER_ORIGIN", ""),  # e.g. https://nssnt.org
+# main.py
+from fastapi.middleware.cors import CORSMiddleware
+app = FastAPI(title="NSSNT Verifier API")
+
+ALLOWED_ORIGINS = [
+    "http://localhost:4173",            # vite preview
+    "http://localhost:3000",            # ( dev server)
+    "https://verify.nssnt-events.com",  # prod SPA
+    "https://nssnt-events.com",         # apex (if it will call API)
 ]
 
-app = FastAPI(title="NSSNT Verifier API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o for o in ALLOW_ORIGINS if o],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,           # ok if you use cookies/auth headers
     allow_methods=["*"],
     allow_headers=["*"],
+    max_age=600,
 )
+
 
 # ──────────────────────────────────────────────
 # Simple API-key auth (env driven)
