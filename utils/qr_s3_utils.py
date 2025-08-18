@@ -109,7 +109,8 @@ def encode_qr_url(payload: Dict[str, Any]) -> str:
     """URL to your public viewer with base64url payload."""
     json_str = json.dumps(payload, default=_to_jsonable, separators=(",", ":"))
     b64 = base64.urlsafe_b64encode(json_str.encode("utf-8")).decode("utf-8")
-    return f"{QR_ROOT_PATH}?data={quote(b64)}"
+    #return f"{QR_ROOT_PATH}?data={quote(b64)}" #- for local run
+    return f"{QR_ROOT_PATH}&data={quote(b64)}" # - when running on server
 
 
 def generate_qr_image(url: str, filename: str, local_folder: str | Path | None = None) -> str:
