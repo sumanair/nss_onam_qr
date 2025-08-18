@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 qp = st.query_params
 page = qp.get("page")
 data = qp.get("data")
-tx   = qp.get("tx")
+
 
 # If a target page is specified, stash extras (data/tx) before switching
 if page:
