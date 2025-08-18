@@ -1,5 +1,6 @@
 
 import streamlit as st
+import streamlit as st
 
 def inject_global_styles():
     st.markdown("""
@@ -12,6 +13,11 @@ def inject_global_styles():
       -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
       font-size: 16px; line-height: 1.55;
     }
+
+    /* 🔒 Hide Streamlit chrome */
+    #MainMenu {visibility: hidden;}   /* Hide the ⋮ menu (Rerun, Settings, etc.) */
+    header {visibility: hidden;}      /* Hide the default top header bar */
+    footer {visibility: hidden;}      /* Hide the footer ("Made with Streamlit") */
 
     /* Scale all text in the main container a touch larger */
     .block-container { max-width: 1280px; padding-top: 2rem; margin-top: .75rem; font-size: 1.02rem; }
@@ -81,6 +87,7 @@ def inject_global_styles():
     .fc-link:hover { text-decoration:underline; color:#800000; }
     </style>
     """, unsafe_allow_html=True)
+
 
 def inject_sidebar_styles():
     import streamlit as st
