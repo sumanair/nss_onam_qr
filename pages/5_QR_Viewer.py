@@ -102,23 +102,29 @@ st.markdown("""
 .qr-sub   { font-size: 1.05rem; color:#6b7280; text-align:center; margin-bottom:.9rem; }
 
 /* Data table (aligned with admin tone) */
-.decoded-table { width:100%; border-collapse:collapse; margin-top:.25rem; }
+.decoded-table {
+  width: 100%;
+  max-width: 720px;        /* limit width */
+  margin: 0 auto;          /* center horizontally */
+  border-collapse: collapse;
+  margin-top: .25rem;
+}
 .decoded-table th, .decoded-table td {
-  border:1px solid #E9E2D6;
-  padding:10px 12px;
+  border: 1px solid #E9E2D6;
+  padding: 10px 12px;
   vertical-align: top;
   word-break: break-word;
-  background:#FFFEFA;
-  color:#111827;
-  font-size:.99rem;
+  background: #FFFEFA;
+  color: #111827;
+  font-size: .99rem;
 }
 .decoded-table th {
-  background:#FCFCE8;
-  font-weight:700;
-  color:#5A0000;
-  width:260px;
+  background: #FCFCE8;
+  font-weight: 700;
+  color: #5A0000;
+  width: 240px;            /* narrower label column */
 }
-.decoded-table tr:nth-child(even) td { background:#FFFDF3; }
+.decoded-table tr:nth-child(even) td { background: #FFFDF3; }
 
 .meta-box {
   margin-top:16px;
@@ -164,13 +170,26 @@ def _escape_html(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def _to_display(v, key: str | None = None) -> str:
-    if v is None: return ""
-    if isinstance(v, float) and math.isnan(v): return ""
-    if isinstance(v, str) and v.strip().lower() in {"nan","none","null"}: return ""
-    if key and key.lower() in {"phone","phone_number","mobile"}:
-        s = re.sub(r"\D+","", str(v))
+    if v is None:
+        return ""
+    if isinstance(v, float) and math.isnan(v):
+        return ""
+    if isinstance(v, str) and v.strip().lower() in {"nan", "none", "null"}:
+        return ""
+
+    # Normalize booleans → Yes / No
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, str) and v.strip().lower() in {"true", "false"}:
+        return "Yes" if v.strip().lower() == "true" else "No"
+
+    # Normalize phone
+    if key and key.lower() in {"phone", "phone_number", "mobile"}:
+        s = re.sub(r"\D+", "", str(v))
         return s
+
     return str(v)
+
 
 def _render_table(obj: Any) -> str:
     if isinstance(obj, dict):
