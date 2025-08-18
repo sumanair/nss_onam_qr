@@ -4,26 +4,43 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
+import streamlit as st
 
-qp = st.query_params
-page = qp.get("page")
-data = qp.get("data")
+def _get1(q, k):
+    v = q.get(k)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
 
+qp    = st.query_params
+page  = _get1(qp, "page")
+data  = _get1(qp, "data")
 
-# If a target page is specified, stash extras (data/tx) before switching
+# Always stash if present (do this BEFORE any switch_page)
+if data:
+    st.session_state["_qr_data"] = data
+
+# Route:
+# - If a page is specified -> go there
+# - Else if we have data -> go to QR Viewer
+target = None
 if page:
-    if data: st.session_state["_qr_data"] = data
-
     target = f"pages/{page}" if not str(page).endswith(".py") else str(page)
+elif data:
+    target = "pages/5_QR_Viewer.py"   # adjust if your filename differs
+
+if target:
     try:
         st.switch_page(target)
     except Exception:
+        # fallbacks
         for cand in ["pages/5_QR_Viewer.py", "pages/QR_Viewer.py"]:
             try:
                 st.switch_page(cand)
                 break
             except Exception:
                 pass
+
 
 # ── Page config FIRST ─────────────────────────────────────────
 st.set_page_config(

@@ -9,13 +9,34 @@ from utils.styling import inject_global_styles, inject_sidebar_styles
 
 st.set_page_config(page_title="QR Data Viewer", layout="centered")
 
-params = st.query_params
-raw_b64 = params.get("data") or st.session_state.get("_qr_data")
 
+def _get1(q, k):
+    v = q.get(k)
+    if isinstance(v, list):
+        return v[0] if v else None
+    return v
+
+# Try URL first; if missing (due to switch_page), use session state
+raw_b64 = _get1(st.query_params, "data") or st.session_state.get("_qr_data")
 
 if not raw_b64:
     st.info("No data parameter found in the URL.")
     st.stop()
+
+# robust base64url decode (handle missing padding)
+pad = (-len(raw_b64)) % 4
+if pad: raw_b64 += "=" * pad
+decoded = base64.urlsafe_b64decode(raw_b64).decode("utf-8")
+
+# your payload can be either {"data": {...}} or just {...}
+obj = json.loads(decoded)
+payload = obj.get("data", obj)
+
+st.title("QR Data Viewer")
+st.json(payload)
+
+# (optional) clear after use so a later visit without params doesn't reuse stale data
+# st.session_state.pop("_qr_data", None)
 # ───────────────────────────────────────────────
 # Global NSSNT look & feel
 # ───────────────────────────────────────────────
