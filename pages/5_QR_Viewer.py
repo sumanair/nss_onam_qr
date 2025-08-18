@@ -9,6 +9,13 @@ from utils.styling import inject_global_styles, inject_sidebar_styles
 
 st.set_page_config(page_title="QR Data Viewer", layout="centered")
 
+params = st.query_params
+raw_b64 = params.get("data") or st.session_state.get("_qr_data")
+tx      = params.get("tx")   or st.session_state.get("_qr_tx")
+
+if not raw_b64:
+    st.info("No data parameter found in the URL.")
+    st.stop()
 # ───────────────────────────────────────────────
 # Global NSSNT look & feel
 # ───────────────────────────────────────────────

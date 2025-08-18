@@ -7,16 +7,18 @@ from dotenv import load_dotenv
 
 qp = st.query_params
 page = qp.get("page")
+data = qp.get("data")
+tx   = qp.get("tx")
 
-# If the URL says which page to show, switch immediately
+# If a target page is specified, stash extras (data/tx) before switching
 if page:
-    # Try file-path first (most robust across versions)
+    if data: st.session_state["_qr_data"] = data
+
     target = f"pages/{page}" if not str(page).endswith(".py") else str(page)
     try:
         st.switch_page(target)
     except Exception:
-        # Fallback to a few common variants
-        for cand in [f"pages/5_QR_Viewer.py", "pages/QR_Viewer.py"]:
+        for cand in ["pages/5_QR_Viewer.py", "pages/QR_Viewer.py"]:
             try:
                 st.switch_page(cand)
                 break
