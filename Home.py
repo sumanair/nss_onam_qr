@@ -4,6 +4,25 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
+
+qp = st.query_params
+page = qp.get("page")
+
+# If the URL says which page to show, switch immediately
+if page:
+    # Try file-path first (most robust across versions)
+    target = f"pages/{page}" if not str(page).endswith(".py") else str(page)
+    try:
+        st.switch_page(target)
+    except Exception:
+        # Fallback to a few common variants
+        for cand in [f"pages/5_QR_Viewer.py", "pages/QR_Viewer.py"]:
+            try:
+                st.switch_page(cand)
+                break
+            except Exception:
+                pass
+
 # ── Page config FIRST ─────────────────────────────────────────
 st.set_page_config(
     page_title="🎟️ NSS Event QR Issuance",
