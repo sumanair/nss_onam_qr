@@ -3,3 +3,4 @@
 *.env
 *.pem
 nssnt-key.pem
+venv/
