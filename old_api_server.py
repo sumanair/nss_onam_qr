@@ -1,5 +1,7 @@
 # api_server.py
 import os
+import datetime
+import secrets
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -14,7 +16,9 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from services import attendance_service  # uses batch-aware child table
+from services import attendance_service  # your existing DB helpers
+from sqlalchemy import text
+from utils.db import get_engine  # reuse project engine
 
 # ──────────────────────────────────────────────
 # CORS (tighten in prod; keep only what you need)
@@ -52,8 +56,7 @@ def require_api_key(
         token = x_api_key.strip()
     elif authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
-    if not token or token != expected:
-        # secrets.compare_digest optional here—but equal-time compare is nice-to-have
+    if not token or not secrets.compare_digest(token, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ──────────────────────────────────────────────
@@ -64,19 +67,11 @@ class Summary(BaseModel):
     email: str
     number_of_attendees: int
     number_checked_in: int
-    remaining: int
-    all_attendees_checked_in: bool
 
 class CheckinReq(BaseModel):
     transaction_id: str = Field(..., min_length=3)
     delta: int
     verifier_id: str | None = None  # optional audit tag (device/user)
-    notes: str | None = None        # optional free-text note
-
-class CheckinResp(BaseModel):
-    message: str
-    checked_in: int
-    remaining: int
 
 # ──────────────────────────────────────────────
 # Health
@@ -88,54 +83,52 @@ def health():
 # ──────────────────────────────────────────────
 # GET summary
 # ──────────────────────────────────────────────
-@app.get(
-    "/api/attendance/summary",
-    response_model=Summary,
-    dependencies=[Depends(require_api_key)],
-)
+@app.get("/api/attendance/summary", response_model=Summary, dependencies=[Depends(require_api_key)])
 def get_summary(transaction_id: str):
     row = attendance_service.fetch_attendance_row_by_txn(transaction_id)
     if not row:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    # row already includes derived fields from child table
     return Summary(
         username=row["username"],
         email=row["email"],
         number_of_attendees=int(row["number_of_attendees"]),
         number_checked_in=int(row["number_checked_in"]),
-        remaining=int(row.get("remaining", max(0, int(row["number_of_attendees"]) - int(row["number_checked_in"])))),
-        all_attendees_checked_in=bool(row.get("all_attendees_checked_in")),
     )
 
 # ──────────────────────────────────────────────
-# POST check-in (atomic delta; batch-aware; audit via triggers)
-#   delta > 0 → create a new batch of that size
-#   delta < 0 → rewind the most recent active batches
+# POST check-in (atomic delta + audit stamp)
 # ──────────────────────────────────────────────
-@app.post(
-    "/api/checkin",
-    response_model=CheckinResp,
-    dependencies=[Depends(require_api_key)],
-)
+@app.post("/api/checkin", dependencies=[Depends(require_api_key)])
 def post_checkin(payload: CheckinReq):
-    ok, msg = attendance_service.update_checkins(
-        payload.transaction_id,
-        int(payload.delta),
-        verifier_id=payload.verifier_id,
-        notes=payload.notes,
-    )
+    # Apply the bounded atomic update using your existing logic
+    ok, msg = attendance_service.update_checkins(payload.transaction_id, int(payload.delta))
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
 
-    # Return updated counts
-    row = attendance_service.fetch_attendance_row_by_txn(payload.transaction_id)
-    if not row:
-        # Extremely unlikely; transaction was just updated
-        raise HTTPException(status_code=404, detail="Transaction not found")
+    # Lightweight audit: who/when (doesn't affect counts)
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE event_payment
+                       SET last_checked_in_at = :now,
+                           last_checked_in_by = :by,
+                           last_updated_at    = :now
+                     WHERE transaction_id = :txn
+                """),
+                {
+                    "now": datetime.datetime.now(),  # match your schema's TIMESTAMP
+                    "by": (payload.verifier_id or "").strip() or None,
+                    "txn": payload.transaction_id,
+                }
+            )
+    except Exception:
+        # Don't fail the request if audit fails; counts are already updated atomically
+        pass
 
-    return CheckinResp(
-        message=msg,
-        checked_in=int(row["number_checked_in"]),
-        remaining=int(row["remaining"]),
-    )
+    # Return updated count for convenience
+    row = attendance_service.fetch_attendance_row_by_txn(payload.transaction_id)
+    checked = int(row["number_checked_in"]) if row else None
+    return {"message": msg, "checked_in": checked}
