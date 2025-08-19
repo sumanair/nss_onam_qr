@@ -43,12 +43,6 @@ def send_issue_or_reissue(
             If you made multiple payments (for guests, extended family, etc.), please make sure to have them all handy.
         </p>
 
-        <div style="margin:16px 0 8px;">
-          <a href="{preview_url}" style="background:#facc15;color:#111418;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:700;display:inline-block;">
-            View QR in Browser (Fallback)
-          </a>
-        </div>
-
         <p>Your valuable feedback and suggestions are welcome.</p>
 
         <p><b>We can’t wait to celebrate Onam with you! 🎉🌼</b></p>
