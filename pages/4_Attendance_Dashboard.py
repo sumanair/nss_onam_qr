@@ -11,20 +11,17 @@ from zoneinfo import ZoneInfo
 st.set_page_config(page_title="Attendance Dashboard", page_icon="📊", layout="wide")
 st.markdown("<div style='margin-bottom: 1.5rem;'></div>", unsafe_allow_html=True)
 
-# ── Shared styling/auth/services (same as your Admin.py) ─────
+# ── Shared styling/services (no auth) ────────────────────────
 from utils.styling import inject_global_styles, inject_sidebar_styles
-from utils.auth_sidebar import render_auth_in_sidebar, require_auth
 from utils.db import get_engine
 from config import EVENT_NAME  # used in title; remove if not needed
 
 inject_global_styles()
 inject_sidebar_styles()
-render_auth_in_sidebar()
-require_auth()  # blocks page until logged in
 
 engine = get_engine()
 
-# ── Optional brand accent bar ────────────────────────────────
+# ── Optional brand accent bar ─────────────────────────────────
 st.markdown("""
 <style>
 .bar {background: linear-gradient(90deg,#7a0019 0 20%, #caa43a 20% 70%, #f59e0b 70% 100%);
@@ -235,7 +232,6 @@ with left:
             st.progress(min(1.0, completion_pct / 100.0))
             st.write(f"**{completion_pct:.1f}% complete**  •  {checked_in:,} / {total_attendees:,} checked‑in")
 
-        
         cols = st.columns(3)
         with cols[0]:
             st.markdown(
@@ -261,7 +257,6 @@ with left:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-
 
         # Footnote outside the card
         st.caption(
