@@ -14,14 +14,15 @@ st.markdown("<div style='margin-bottom: 1.5rem;'></div>", unsafe_allow_html=True
 # ── Shared styling/services (no auth) ────────────────────────
 from utils.styling import inject_global_styles, inject_sidebar_styles
 from utils.db import get_engine
-from config import EVENT_NAME  # used in title; remove if not needed
+from config import EVENT_NAME
 
 inject_global_styles()
 inject_sidebar_styles()
 
 engine = get_engine()
+LOCAL_TZ = os.getenv("DISPLAY_TZ", "America/Chicago")
 
-# ── Optional brand accent bar ─────────────────────────────────
+# ── Accent bar ───────────────────────────────────────────────
 st.markdown("""
 <style>
 .bar {background: linear-gradient(90deg,#7a0019 0 20%, #caa43a 20% 70%, #f59e0b 70% 100%);
@@ -30,22 +31,19 @@ st.markdown("""
 <div class="bar"></div>
 """, unsafe_allow_html=True)
 
-st.title(f"📊 Attendance Dashboard — {EVENT_NAME}")
+# Center the title + subheader
+_, mid, _ = st.columns([1, 2, 1])
+with mid:
+    st.title("📊 Attendance Dashboard")
+    st.subheader(EVENT_NAME)
 
-# ── Sidebar controls ─────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────
 st.sidebar.header("Controls")
 auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True)
 interval_s   = st.sidebar.slider("Refresh every (seconds)", 5, 60, 10)
 
-LOCAL_TZ = os.getenv("DISPLAY_TZ", "America/Chicago")
-
 # ── Helpers ──────────────────────────────────────────────────
 def load_revokes_summary():
-    """
-    Totals across all time:
-      - admitted_sum: sum of +count_checked_in
-      - revoked_sum:  sum of revoked (positive magnitude)
-    """
     sql = text("""
     SELECT
       COALESCE(SUM(CASE WHEN ec.revoked_yn = FALSE THEN ec.count_checked_in END), 0) AS admitted_sum,
@@ -56,51 +54,97 @@ def load_revokes_summary():
         r = conn.execute(sql).mappings().first()
     return int(r["admitted_sum"] or 0), int(r["revoked_sum"] or 0)
 
-# ── Data loaders (event_payment + event_checkin) ─────────────
-def load_totals():
+def load_totals_and_status():
+    """
+    Compute NET check-ins per payment (undo-friendly):
+      net_checked_in = sum(+count) - sum(revoked count)
+    Clamp per payment: min(max(net, 0), ep.number_of_attendees)
+
+    Returns:
+      total_attendees, checked_in_attendees, remaining_attendees,
+      tx_total, tx_full, tx_partial, tx_not_started,
+      attendees_not_started, attendees_remaining_in_progress
+    """
     sql = text("""
     WITH roll AS (
       SELECT
         ec.payment_id,
-        COALESCE(SUM(CASE WHEN ec.revoked_yn = FALSE THEN ec.count_checked_in END), 0) AS checked_in
+        COALESCE(SUM(CASE WHEN ec.revoked_yn IS TRUE
+                          THEN -ec.count_checked_in
+                          ELSE  ec.count_checked_in END), 0) AS net_checked_in
       FROM event_checkin ec
       GROUP BY ec.payment_id
+    ),
+    joined AS (
+      SELECT
+        ep.id,
+        ep.number_of_attendees,
+        GREATEST(0, COALESCE(roll.net_checked_in, 0)) AS net_raw
+      FROM event_payment ep
+      LEFT JOIN roll ON roll.payment_id = ep.id
+    ),
+    clamped AS (
+      SELECT
+        id,
+        number_of_attendees,
+        LEAST(net_raw, number_of_attendees) AS net_clamped
+      FROM joined
     )
     SELECT
-      COALESCE(SUM(ep.number_of_attendees), 0) AS total_attendees,
-      COALESCE(SUM(roll.checked_in), 0)        AS checked_in,
-      COUNT(*)                                  AS transactions_total,
-      SUM(
-        CASE WHEN COALESCE(roll.checked_in, 0) >= ep.number_of_attendees THEN 1 ELSE 0 END
-      )                                         AS transactions_completed
-    FROM event_payment ep
-    LEFT JOIN roll ON roll.payment_id = ep.id;
+      COALESCE(SUM(number_of_attendees), 0) AS total_attendees,
+      COALESCE(SUM(net_clamped), 0) AS checked_in_attendees,
+
+      -- attendees in tx with 0 net
+      COALESCE(SUM(CASE WHEN net_clamped = 0
+                        THEN number_of_attendees ELSE 0 END), 0) AS attendees_not_started,
+
+      -- attendees remaining only within partial tx
+      COALESCE(SUM(CASE WHEN net_clamped > 0 AND net_clamped < number_of_attendees
+                        THEN number_of_attendees - net_clamped ELSE 0 END), 0) AS attendees_remaining_in_progress,
+
+      COUNT(*) AS tx_total,
+      COALESCE(SUM(CASE WHEN net_clamped >= number_of_attendees THEN 1 ELSE 0 END), 0) AS tx_full,
+      COALESCE(SUM(CASE WHEN net_clamped = 0 THEN 1 ELSE 0 END), 0) AS tx_not_started,
+      COALESCE(SUM(CASE WHEN net_clamped > 0 AND net_clamped < number_of_attendees THEN 1 ELSE 0 END), 0) AS tx_partial
+    FROM clamped;
     """)
     with engine.begin() as conn:
         r = conn.execute(sql).mappings().first()
-    total = int(r["total_attendees"] or 0)
-    checked = int(r["checked_in"] or 0)
-    remaining = max(0, total - checked)
-    tx_total = int(r["transactions_total"] or 0)
-    tx_done  = int(r["transactions_completed"] or 0)
-    return total, checked, remaining, tx_total, tx_done
+
+    total_attendees = int(r["total_attendees"] or 0)
+    checked_in_attendees = int(r["checked_in_attendees"] or 0)
+    attendees_not_started = int(r["attendees_not_started"] or 0)
+    attendees_remaining_in_progress = int(r["attendees_remaining_in_progress"] or 0)
+
+    remaining_attendees = max(0, total_attendees - checked_in_attendees)
+
+    tx_total = int(r["tx_total"] or 0)
+    tx_full = int(r["tx_full"] or 0)
+    tx_partial = int(r["tx_partial"] or 0)
+    tx_not_started = int(r["tx_not_started"] or 0)
+
+    return (total_attendees, checked_in_attendees, remaining_attendees,
+            tx_total, tx_full, tx_partial, tx_not_started,
+            attendees_not_started, attendees_remaining_in_progress)
 
 def load_by_type():
     sql = text("""
     WITH roll AS (
       SELECT
         ec.payment_id,
-        COALESCE(SUM(CASE WHEN ec.revoked_yn = FALSE THEN ec.count_checked_in END), 0) AS checked_in
+        COALESCE(SUM(CASE WHEN ec.revoked_yn IS TRUE
+                          THEN -ec.count_checked_in
+                          ELSE  ec.count_checked_in END), 0) AS net_checked_in
       FROM event_checkin ec
       GROUP BY ec.payment_id
     )
     SELECT
       COALESCE(ep.paid_for, '(unknown)') AS ticket_type,
       SUM(ep.number_of_attendees)        AS total_attendees,
-      COALESCE(SUM(roll.checked_in), 0)  AS checked_in,
-      SUM(ep.number_of_attendees) - COALESCE(SUM(roll.checked_in), 0) AS remaining,
+      COALESCE(SUM(LEAST(GREATEST(roll.net_checked_in,0), ep.number_of_attendees)), 0)  AS checked_in,
+      SUM(ep.number_of_attendees) - COALESCE(SUM(LEAST(GREATEST(roll.net_checked_in,0), ep.number_of_attendees)), 0) AS remaining,
       COUNT(*) AS transactions,
-      SUM(CASE WHEN COALESCE(roll.checked_in,0) >= ep.number_of_attendees THEN 1 ELSE 0 END)
+      SUM(CASE WHEN COALESCE(roll.net_checked_in,0) >= ep.number_of_attendees THEN 1 ELSE 0 END)
         AS transactions_completed
     FROM event_payment ep
     LEFT JOIN roll ON roll.payment_id = ep.id
@@ -110,76 +154,52 @@ def load_by_type():
     with engine.begin() as conn:
         return pd.read_sql(sql, conn)
 
-def load_today_10min_delta_and_cum():
-    """
-    Today-only in LOCAL_TZ, 10-minute buckets.
-    Deltas: +count for admits, -count for revokes.
-    Cumulative: running sum of delta across the local day.
-    """
-    sql = text("""
-    SELECT
-      to_timestamp(
-        floor(
-          extract(epoch from (COALESCE(ec.revoked_at, ec.created_at) AT TIME ZONE :tz)) / 600
-        ) * 600
-      ) AS ts_10m,
-      SUM(
-        CASE WHEN ec.revoked_yn = TRUE
-             THEN -ec.count_checked_in
-             ELSE  ec.count_checked_in
-        END
-      ) AS delta
-    FROM event_checkin ec
-    WHERE (COALESCE(ec.revoked_at, ec.created_at) AT TIME ZONE :tz)::date = (now() AT TIME ZONE :tz)::date
-    GROUP BY 1
-    ORDER BY 1;
-    """)
-    with engine.begin() as conn:
-        df = pd.read_sql(sql, conn, params={"tz": LOCAL_TZ})
-
-    # Build the 10-min timeline in the *local* timezone, then drop tz to match SQL output
-    tz = ZoneInfo(LOCAL_TZ)
-    now_local = pd.Timestamp.now(tz=tz)
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = now_local.floor("10min")
-    idx = pd.date_range(start=start_local, end=end_local, freq="10min").tz_localize(None)
-
-    if df.empty:
-        out = pd.DataFrame({"ts_10m": idx, "delta": 0})
-    else:
-        # SQL returns naive timestamps that represent local time already
-        df["ts_10m"] = pd.to_datetime(df["ts_10m"])
-        out = (
-            df.set_index("ts_10m")
-              .reindex(idx, fill_value=0)
-              .rename_axis("ts_10m")
-              .reset_index()
-              .rename(columns={"index": "ts_10m"})
-        )
-
-    out["cumulative"] = out["delta"].cumsum()
-    return out
-
 def load_recent(limit: int = 500):
+    """
+    Recent admissions/revokes with human-friendly identity and per-transaction status.
+    Status is computed against *current* net totals per payment (net of revokes).
+    """
     sql = text("""
+    WITH roll AS (
+      SELECT
+        ec.payment_id,
+        COALESCE(SUM(CASE WHEN ec.revoked_yn IS TRUE
+                          THEN -ec.count_checked_in
+                          ELSE  ec.count_checked_in END), 0) AS net_checked_in
+      FROM event_checkin ec
+      GROUP BY ec.payment_id
+    )
     SELECT
       (COALESCE(ec.revoked_at, ec.created_at) AT TIME ZONE :tz) AS ts_local,
-      ep.transaction_id,
-      CASE WHEN ec.revoked_yn = TRUE THEN -ec.count_checked_in ELSE ec.count_checked_in END AS delta,
+      COALESCE(ep.username, '') AS username,
+      COALESCE(ep.email, '') AS email,
       COALESCE(ep.paid_for,'') AS ticket_type,
+      COALESCE(ep.number_of_attendees, 0) AS attendees_total,
       COALESCE(ec.verifier_id,'') AS verifier_id,
-      ec.revoked_yn
+      CASE WHEN ec.revoked_yn = TRUE THEN -ec.count_checked_in ELSE ec.count_checked_in END AS delta,
+      ec.revoked_yn,
+      CASE
+        WHEN LEAST(GREATEST(roll.net_checked_in,0), ep.number_of_attendees) >= ep.number_of_attendees
+          THEN 'Full'
+        WHEN COALESCE(roll.net_checked_in, 0) = 0
+          THEN 'Not started'
+        ELSE 'Partial'
+      END AS status
     FROM event_checkin ec
     JOIN event_payment ep ON ep.id = ec.payment_id
+    LEFT JOIN roll ON roll.payment_id = ep.id
     ORDER BY COALESCE(ec.revoked_at, ec.created_at) DESC
     LIMIT :limit;
     """)
     with engine.begin() as conn:
-        return pd.read_sql(sql, conn, params={"tz": LOCAL_TZ, "limit": limit})
+        df = pd.read_sql(sql, conn, params={"tz": LOCAL_TZ, "limit": limit})
+    return df
 
 # ── KPIs ─────────────────────────────────────────────────────
 try:
-    total, checked, remaining, tx_total, tx_done = load_totals()
+    (total, checked, remaining,
+     tx_total, tx_full, tx_partial, tx_not_started,
+     attendees_not_started, attendees_remaining_in_progress) = load_totals_and_status()
 except Exception as e:
     st.error(f"Error loading totals: {e}")
     st.stop()
@@ -189,80 +209,171 @@ k1.metric("Total Attendees", f"{total:,}")
 k2.metric("Checked-in", f"{checked:,}")
 k3.metric("Remaining", f"{remaining:,}")
 k4.metric("Transactions", f"{tx_total:,}")
-k5.metric("Completed Trans.", f"{tx_done:,}")
+k5.metric("Completed Trans.", f"{tx_full:,}")
 
 st.markdown("---")
 
-# ── Chart (left) + Recent Check-ins (right) ──────────────────
+# ── Charts (left) + Recent Check-ins (right) ─────────────────
 left, right = st.columns([1, 1.4])
 
 with left:
-    st.subheader("Attendance Progress (Overall)")
-
+    st.subheader("Attendance (Headcount)")
     try:
-        # These already computed above
-        total_attendees = total
-        checked_in = checked
-        remaining_total = max(0, total_attendees - checked_in)
-
-        # Extra signal: revokes
         admitted_sum, revoked_sum = load_revokes_summary()
         revoke_rate = (revoked_sum / admitted_sum * 100) if admitted_sum > 0 else 0.0
 
-        completion_pct = (checked_in / total_attendees * 100) if total_attendees > 0 else 0.0
+        # Colors (WCAG-friendly on your light background)
+        GREEN = "#16a34a"   # checked/complete
+        BLUE  = "#3b82f6"   # in-progress (transactions that have begun)
+        ORANGE= "#f59e0b"   # not started
 
-        # Donut gauge (Altair). Falls back to Streamlit if Altair isn't present.
-        data = pd.DataFrame({"label": ["Checked‑in", "Remaining"], "value": [checked_in, remaining_total]})
-
+        # ── Donut A: Attendees status (Headcount) — no "Partial" label here
+        
         try:
             import altair as alt
-            chart = alt.Chart(data).mark_arc(innerRadius=70).encode(
+            not_checked = attendees_not_started + attendees_remaining_in_progress
+            data_att = pd.DataFrame({
+                "label": ["Checked-in", "Not checked-in"],
+                "value": [checked, not_checked],
+            })
+            donut_att = alt.Chart(data_att).mark_arc(innerRadius=70).encode(
                 theta=alt.Theta("value:Q"),
-                color=alt.Color("label:N", legend=alt.Legend(title=None)),
-                tooltip=["label:N", "value:Q"]
-            ).properties(height=260)
-
-            center_text = alt.Chart(pd.DataFrame({"text": [f"{completion_pct:.1f}%"]})).mark_text(
-                fontSize=28, fontWeight="bold"
-            ).encode(text="text:N")
-
-            st.altair_chart(chart + center_text, use_container_width=True)
+                color=alt.Color(
+                    "label:N",
+                    legend=alt.Legend(title=None),
+                    scale=alt.Scale(
+                        domain=["Checked-in", "Not checked-in"],
+                        range=[GREEN, ORANGE],  # green for checked, orange for not yet scanned
+                    ),
+                ),
+                tooltip=["label:N", "value:Q"],
+            ).properties(height=260, title="Attendees status (Headcount)")
+            st.altair_chart(donut_att, use_container_width=True)
         except Exception:
-            # Fallback
-            st.progress(min(1.0, completion_pct / 100.0))
-            st.write(f"**{completion_pct:.1f}% complete**  •  {checked_in:,} / {total_attendees:,} checked‑in")
+            not_checked = attendees_not_started + attendees_remaining_in_progress
+            st.write(
+                f"**Attendees (Headcount):** "
+                f"✅ Checked-in {checked:,} • "
+                f"🟠 Not checked-in {not_checked:,}"
+            )
 
+        # KPI tiles under the donut
+        not_checked = attendees_not_started + attendees_remaining_in_progress
         cols = st.columns(3)
         with cols[0]:
             st.markdown(
                 f"<div style='text-align:center;'>"
                 f"<div style='font-weight:600; color:#374151;'>Checked-in</div>"
-                f"<div style='font-size:1.8rem; font-weight:700;'>{checked_in:,}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
+                f"<div style='font-size:1.8rem; font-weight:700;'>{checked:,}</div>"
+                f"</div>", unsafe_allow_html=True
             )
         with cols[1]:
             st.markdown(
                 f"<div style='text-align:center;'>"
-                f"<div style='font-weight:600; color:#374151;'>Remaining</div>"
-                f"<div style='font-size:1.8rem; font-weight:700;'>{remaining_total:,}</div>"
-                f"</div>",
-                unsafe_allow_html=True,
+                f"<div style='font-weight:600; color:#374151;'>Not checked-in</div>"
+                f"<div style='font-size:1.8rem; font-weight:700;'>{not_checked:,}</div>"
+                f"</div>", unsafe_allow_html=True
             )
         with cols[2]:
+            completion_pct = (checked / total * 100) if total > 0 else 0.0
             st.markdown(
                 f"<div style='text-align:center;'>"
                 f"<div style='font-weight:600; color:#374151;'>Completion</div>"
                 f"<div style='font-size:1.8rem; font-weight:700;'>{completion_pct:.1f}%</div>"
-                f"</div>",
+                f"</div>", unsafe_allow_html=True
+            )
+
+        # Caption (headcount-only wording; no "in progress" here)
+        st.caption(
+            "Headcount view. Orange = not yet scanned (includes both orders that have not started and those in progress). "
+            f"Revoked entries: {revoked_sum:,} ({revoke_rate:.1f}% of admits)."
+        )
+
+
+        # ── Transactions Progress (Payment level) — 100% stacked horizontal bar
+        st.markdown("#### Transactions Progress (Individual Payment level)")
+
+        # Always show preview toggle; default ON only when there is no live data yet
+        preview_tx = st.checkbox("Preview with sample data", value=(tx_total == 0), key="preview_tx")
+
+        # Choose data source
+        if preview_tx:
+            total_tx_sample   = max(tx_total, 15)
+            tx_full_v         = max(1, int(round(total_tx_sample * 0.30)))
+            tx_partial_v      = max(1, int(round(total_tx_sample * 0.40)))
+            tx_not_started_v  = max(0, total_tx_sample - tx_full_v - tx_partial_v)
+            total_tx_v        = total_tx_sample
+            preview_note      = " (preview)"
+        else:
+            tx_full_v, tx_partial_v, tx_not_started_v = tx_full, tx_partial, tx_not_started
+            total_tx_v   = tx_total if tx_total > 0 else 1
+            preview_note = ""
+
+        try:
+            import altair as alt
+
+            # Build dataframe for the bar
+            df_pf = pd.DataFrame({
+                "status": ["Full", "Partial", "Not started"],
+                "count":  [tx_full_v, tx_partial_v, tx_not_started_v],
+            })
+            df_pf["pct"]   = df_pf["count"] / (total_tx_v if total_tx_v else 1)
+            df_pf["label"] = df_pf.apply(lambda r: f'{int(r["count"])} ({r["pct"]:.0%})', axis=1)
+            df_pf["group"] = "All transactions"
+
+            # Main 100% stacked bar (legend disabled here — we render a manual one below)
+            bar = alt.Chart(df_pf).mark_bar(height=36).encode(
+                y=alt.Y("group:N", axis=None),
+                x=alt.X("count:Q", stack="normalize", axis=alt.Axis(format="%", title=None)),
+                color=alt.Color(
+                    "status:N",
+                    scale=alt.Scale(
+                        domain=["Full", "Partial", "Not started"],
+                        range=[GREEN, BLUE, ORANGE],
+                    ),
+                    legend=None,  # manual legend below so it ALWAYS shows
+                ),
+                tooltip=[
+                    alt.Tooltip("status:N", title="Status"),
+                    alt.Tooltip("count:Q",  title="Count"),
+                    alt.Tooltip("pct:Q",    title="Share", format=".0%"),
+                ],
+            ).properties(height=60, title=f"Share of orders by status{preview_note}")
+
+            # In-bar white labels (only on non-zero segments)
+            labels = alt.Chart(df_pf[df_pf["count"] > 0]).mark_text(
+                baseline="middle", dy=0, color="white"
+            ).encode(
+                y=alt.Y("group:N", axis=None),
+                x=alt.X("count:Q", stack="normalize"),
+                text="label:N",
+            )
+
+            st.altair_chart(bar + labels, use_container_width=True)
+
+            # Always-visible legend (HTML, independent of Altair)
+            st.markdown(
+                f"""
+                <div style="display:flex; gap:16px; align-items:center; font-size:0.9rem; margin-top:6px;">
+                <span><span style="display:inline-block; width:12px; height:12px; background:{GREEN}; border-radius:2px; margin-right:6px;"></span>Full</span>
+                <span><span style="display:inline-block; width:12px; height:12px; background:{BLUE}; border-radius:2px; margin-right:6px;"></span>Partial</span>
+                <span><span style="display:inline-block; width:12px; height:12px; background:{ORANGE}; border-radius:2px; margin-right:6px;"></span>Not started</span>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
 
-        # Footnote outside the card
-        st.caption(
-            f"Revoked entries: {revoked_sum:,} "
-            f"({revoke_rate:.1f}% of all admits). Net checked-in = admits − revokes."
-        )
+            if preview_tx:
+                st.caption("Preview with sample data — toggle off to see live numbers.")
+        except Exception:
+            pct = lambda n, d: (n / d * 100) if d else 0
+            st.write(
+                f"**Transactions (Payment level){preview_note}:** "
+                f"✅ Full {tx_full_v:,} ({pct(tx_full_v, total_tx_v):.0f}%) • "
+                f"🔵 Partial {tx_partial_v:,} ({pct(tx_partial_v, total_tx_v):.0f}%) • "
+                f"🟠 Not started {tx_not_started_v:,} ({pct(tx_not_started_v, total_tx_v):.0f}%)"
+            )
+
 
     except Exception as e:
         st.error(f"Error rendering progress: {e}")
@@ -271,35 +382,115 @@ with right:
     st.subheader("Recent Check-ins")
 
     NUM_ROWS_VIEWPORT = 10
-    ROW_PX = 34        # approx row height
-    HEADER_PX = 38     # header height
+    ROW_PX = 34
+    HEADER_PX = 38
     PADDING_PX = 16
-    TABLE_HEIGHT = HEADER_PX + NUM_ROWS_VIEWPORT * ROW_PX + PADDING_PX  # ~10 visible rows
+    TABLE_HEIGHT = HEADER_PX + NUM_ROWS_VIEWPORT * ROW_PX + PADDING_PX
 
     try:
         recent = load_recent(500)
         if recent.empty:
             st.info("No recent events.")
         else:
+            # We don't display ts_local or ticket_type anymore, but keep parse for consistency if needed later
             recent["ts_local"] = pd.to_datetime(recent["ts_local"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            def _payee_cell(row):
+                name = (row.get("username") or "").strip()
+                email = (row.get("email") or "").strip()
+                if name and email:
+                    return f"{name}\n{email}"   # newline between name and email
+                return name or email or "(unknown)"
+
+            recent["Payee"] = recent.apply(_payee_cell, axis=1)
             recent["Δ"] = recent["delta"]
             recent = recent.drop(columns=["delta"])
 
-            st.dataframe(
-                recent.rename(columns={
-                    "ts_local": "When",
-                    "transaction_id": "Transaction",
-                    "ticket_type": "Type",
-                    "verifier_id": "Verifier",
-                    "revoked_yn": "Revoke",
-                }),
-                use_container_width=True,
-                hide_index=True,
-                height=TABLE_HEIGHT,
+        display_df = recent.rename(columns={
+            "verifier_id": "Verifier",
+            "revoked_yn": "Revoke",
+            "status": "Status",
+        })[["Payee", "Verifier", "Δ", "Revoke", "Status"]]
+
+        # ---- Render as custom HTML (scrollable, no index, Payee on two lines) ----
+        from html import escape
+
+        def _bool_icon(v):
+            s = str(v).lower()
+            if s in ("true", "t", "1", "yes", "y"):  return "✅"
+            if s in ("false", "f", "0", "no", "n"):  return "—"
+            return escape(str(v))
+
+        rows_html = []
+        for _, r in display_df.iterrows():
+            payee_html  = escape(str(r["Payee"])).replace("\n", "<br>")
+            verifier    = escape(str(r["Verifier"]))
+            delta_raw   = r["Δ"]
+            # color Δ: green for +, red for −
+            try:
+                d = float(delta_raw)
+            except Exception:
+                d = None
+            if d is None or d == 0:
+                delta_html = escape(str(delta_raw))
+                delta_style = ""
+            else:
+                delta_html = f"{'+' if d>0 else ''}{int(d) if d.is_integer() else d}"
+                delta_style = "color:#16a34a;" if d > 0 else "color:#b91c1c;"  # green / red
+            revoke      = _bool_icon(r["Revoke"])
+            status      = escape(str(r["Status"]))
+            rows_html.append(
+                f"<tr>"
+                f"<td class='payee'>{payee_html}</td>"
+                f"<td>{verifier}</td>"
+                f"<td style='text-align:right; {delta_style}'>{delta_html}</td>"
+                f"<td style='text-align:center;'>{revoke}</td>"
+                f"<td>{status}</td>"
+                f"</tr>"
             )
-            st.caption(f"Showing latest {len(recent)} events (scroll for more).")
+
+        table_html = f"""
+        <style>
+        .recent-wrap {{
+            max-height:{TABLE_HEIGHT}px; overflow-y:auto;
+            border-radius:12px; border:1px solid rgba(0,0,0,0.08);
+            background:transparent;
+        }}
+        .recent-table {{ width:100%; border-collapse:separate; border-spacing:0; }}
+        .recent-table th, .recent-table td {{ padding:10px 12px; border-bottom:1px solid rgba(0,0,0,0.06); }}
+        .recent-table thead th {{
+            position: sticky; top: 0; z-index: 1;
+            background: rgba(0,0,0,0.03);
+            border-bottom:1px solid rgba(0,0,0,0.12);
+            text-align:left;
+        }}
+        .recent-table th[title] {{ text-decoration: underline dotted; cursor: help; }}
+        .recent-table td.payee {{ white-space: pre-line; }}
+        </style>
+        <div class="recent-wrap">
+        <table class="recent-table">
+            <thead>
+            <tr>
+                <th title="Buyer on the payment (name and email)">Payee</th>
+                <th title="Staff/volunteer who scanned">Verifier</th>
+                <th title="Net change for this event row: + admits, − revokes">Δ</th>
+                <th title="This row is a revoke (undo) action">Revoke</th>
+                <th title="Current order status from net admits vs quantity">Status</th>
+            </tr>
+            </thead>
+            <tbody>
+            {''.join(rows_html)}
+            </tbody>
+        </table>
+        </div>
+        """
+        st.markdown(table_html, unsafe_allow_html=True)
+        st.caption("Status reflects current **net** totals per transaction.")
+
     except Exception as e:
         st.error(f"Error loading recent activity: {e}")
+
+
 
 st.markdown("---")
 
